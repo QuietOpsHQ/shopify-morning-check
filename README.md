@@ -48,7 +48,6 @@ Click **Execute workflow**. The email should arrive in a few seconds. Then **Pub
 |---|---|---|
 | `stuck_after_hours` | 48 | Paid orders older than this that are unfulfilled or partly shipped |
 | `low_stock_threshold` | 5 | Variants with this many units or fewer |
-| `include_sold_out` | false | Also list variants already at 0 |
 | `api_version` | 2026-07 | Shopify Admin API version |
 
 ## Troubleshooting
@@ -61,7 +60,14 @@ Click **Execute workflow**. The email should arrive in a few seconds. Then **Pub
 
 ## How it works
 
-One Code node runs two paginated GraphQL queries (orders and product variants) with retry on `THROTTLED`, 429 and 5xx, filters out untracked and draft items, and renders an inline-styled HTML email that looks right in Gmail and Outlook.
+Every step is a native n8n node, so you can see and change it on the canvas:
+
+1. **Get Shopify access token**: fresh token on every run (client-credentials grant).
+2. **Get stuck orders** and **Get low-stock variants**: two Admin GraphQL calls (up to 100 results each), retried on failure.
+3. **Shopify error?**: stops the run with a clear message if Shopify returns an error (for example a missing scope).
+4. **Build the report**: keeps tracked, active, in-stock variants and works out how long each order has waited.
+5. **Anything to report?**: quiet days send no email.
+6. **Email template** (HTML node) and **Send email (Gmail)**: an inline-styled email that looks right in Gmail and Outlook.
 
 ---
 

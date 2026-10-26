@@ -26,37 +26,31 @@
         "assignments": {
           "assignments": [
             {
-              "id": "0591ed6b-5d03-4ed4-a5f2-55d6247d9a2b",
+              "id": "7528a851-1bdb-48e1-a9af-097623b7b57a",
               "name": "shop_domain",
               "value": "your-store.myshopify.com",
               "type": "string"
             },
             {
-              "id": "15ba5fe5-bc46-4ff7-a542-67616bef262e",
+              "id": "b5a1c8db-ef95-44eb-ad0e-32e078aca02f",
               "name": "email_to",
               "value": "you@example.com",
               "type": "string"
             },
             {
-              "id": "8e907c0d-0990-4503-aeab-89837954e7b9",
+              "id": "17fe5fb9-db5d-4f05-ae04-3aa2b10bbfff",
               "name": "stuck_after_hours",
               "value": 48,
               "type": "number"
             },
             {
-              "id": "bba7e528-6db9-4152-ac2e-ad8aba963eac",
+              "id": "fa200442-ffab-4eb1-a594-3b6350495c44",
               "name": "low_stock_threshold",
               "value": 5,
               "type": "number"
             },
             {
-              "id": "6b6ef5d4-bb2e-493d-a90c-b27628de807a",
-              "name": "include_sold_out",
-              "value": false,
-              "type": "boolean"
-            },
-            {
-              "id": "e3279038-75fc-45ef-a8dc-351a8138488a",
+              "id": "e0708ad1-c14b-49ae-a907-07b35320a49c",
               "name": "api_version",
               "value": "2026-07",
               "type": "string"
@@ -77,7 +71,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ (/^https?:\\/\\//.test($json.shop_domain) ? $json.shop_domain : 'https://' + $json.shop_domain).replace(/\\/+$/, '') }}/admin/oauth/access_token",
+        "url": "={{ (/^https?:\\/\\//.test($('Config').item.json.shop_domain) ? $('Config').item.json.shop_domain : 'https://' + $('Config').item.json.shop_domain).replace(/\\/+$/, '') }}/admin/oauth/access_token",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpCustomAuth",
         "sendBody": true,
@@ -102,25 +96,216 @@
       "position": [
         440,
         300
-      ]
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
     },
     {
       "parameters": {
-        "jsCode": "// Shopify Morning Check (free version): paid orders that haven't shipped + variants running low, in one email.\r\n// No dependencies. `gql(query, variables)` is injected so the same code runs inside n8n and in tests.\r\n\r\nconst Q_SHOP = `query { shop { name myshopifyDomain ianaTimezone currencyCode } }`;\r\n\r\nconst Q_STUCK = `query($q: String!, $after: String) {\r\n  orders(first: 50, after: $after, query: $q, sortKey: CREATED_AT) {\r\n    pageInfo { hasNextPage endCursor }\r\n    nodes { id name createdAt displayFulfillmentStatus totalPriceSet { shopMoney { amount } } }\r\n  }\r\n}`;\r\n\r\nconst Q_LOW_STOCK = `query($q: String!, $after: String) {\r\n  productVariants(first: 100, after: $after, query: $q) {\r\n    pageInfo { hasNextPage endCursor }\r\n    nodes { id title sku inventoryQuantity inventoryItem { tracked } product { id title status } }\r\n  }\r\n}`;\r\n\r\nasync function paginate(gql, query, vars, key, maxItems) {\r\n  const out = [];\r\n  let after = null;\r\n  for (;;) {\r\n    const conn = (await gql(query, { ...vars, after }))[key];\r\n    out.push(...conn.nodes);\r\n    if (!conn.pageInfo.hasNextPage || out.length >= maxItems) break;\r\n    after = conn.pageInfo.endCursor;\r\n  }\r\n  return out.slice(0, maxItems);\r\n}\r\n\r\nasync function fetchCheck(gql, cfg, now) {\r\n  const shop = (await gql(Q_SHOP, {})).shop;\r\n  const cutoff = new Date(now.getTime() - cfg.stuck_after_hours * 3600000).toISOString().replace('.000Z', 'Z');\r\n  const stuck = await paginate(gql, Q_STUCK, {\r\n    q: `financial_status:paid AND status:open AND (fulfillment_status:unshipped OR fulfillment_status:partial) AND created_at:<'${cutoff}'`,\r\n  }, 'orders', 250);\r\n  const lowStock = await paginate(gql, Q_LOW_STOCK, { q: `inventory_quantity:<=${cfg.low_stock_threshold}` }, 'productVariants', 500);\r\n  return { shop, now: now.toISOString(), stuck, lowStock };\r\n}\r\n\r\nfunction analyzeCheck(data, cfg) {\r\n  const now = Date.parse(data.now);\r\n  const stuck = data.stuck\r\n    .map(o => ({ id: o.id, name: o.name, status: o.displayFulfillmentStatus === 'PARTIALLY_FULFILLED' ? 'Partly shipped' : 'Not shipped', total: Number(o.totalPriceSet.shopMoney.amount),\r\n      hours: Math.floor((now - Date.parse(o.createdAt)) / 3600000) }))\r\n    .sort((a, b) => b.hours - a.hours);\r\n  const lowStock = data.lowStock\r\n    .filter(v => !(v.inventoryItem && v.inventoryItem.tracked === false))\r\n    .filter(v => !v.product || !v.product.status || v.product.status === 'ACTIVE')\r\n    .filter(v => cfg.include_sold_out || v.inventoryQuantity > 0)\r\n    .map(v => ({ id: v.id, product: v.product.title, variant: v.title === 'Default Title' ? '' : v.title, sku: v.sku, onHand: v.inventoryQuantity }))\r\n    .sort((a, b) => a.onHand - b.onHand);\r\n  const domain = String(data.shop.myshopifyDomain || '').replace('.myshopify.com', '');\r\n  return { shop: { name: data.shop.name, currency: data.shop.currencyCode, adminBase: `https://admin.shopify.com/store/${domain}` },\r\n    stuck, lowStock, threshold: cfg.low_stock_threshold, stuckAfter: cfg.stuck_after_hours };\r\n}\r\n\r\nfunction fmtMoney(v, cur) {\r\n  try { return new Intl.NumberFormat('en-US', { style: 'currency', currency: cur || 'USD' }).format(v); }\r\n  catch (e) { return `${cur || ''} ${Number(v).toFixed(2)}`; }\r\n}\r\n\r\nfunction esc(s) {\r\n  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\r\n}\r\n\r\nfunction subjectCheck(c) {\r\n  const parts = [];\r\n  if (c.stuck.length) parts.push(`${c.stuck.length} unshipped order${c.stuck.length > 1 ? 's' : ''}`);\r\n  if (c.lowStock.length) parts.push(`${c.lowStock.length} low-stock variant${c.lowStock.length > 1 ? 's' : ''}`);\r\n  return `${c.shop.name}: ${parts.length ? parts.join(', ') : 'all clear'}`;\r\n}\r\n\r\nfunction renderCheck(c) {\r\n  const C = { ink: '#1a1a1a', muted: '#6b6b6b', line: '#e6e6e6', bg: '#f6f6f4', red: '#b42318', green: '#067647' };\r\n  const table = (heads, rows) => `<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse:collapse;font-size:13px\">\r\n<tr>${heads.map((h, i) => `<th style=\"text-align:${i ? 'right' : 'left'};color:${C.muted};font-weight:600;padding:6px 0;border-bottom:1px solid ${C.line}\">${h}</th>`).join('')}</tr>\r\n${rows.map(r => `<tr>${r.map((v, i) => `<td style=\"text-align:${i ? 'right' : 'left'};padding:7px 0;border-bottom:1px solid ${C.line};color:${C.ink}\">${v}</td>`).join('')}</tr>`).join('')}</table>`;\r\n  const section = (title, body) => `<tr><td style=\"padding:18px 24px 4px;font-size:15px;font-weight:700;color:${C.ink}\">${title}</td></tr><tr><td style=\"padding:4px 24px 8px\">${body}</td></tr>`;\r\n  const ok = text => `<div style=\"font-size:14px;color:${C.green}\">${text}</div>`;\r\n  const link = o => `<a href=\"${c.shop.adminBase}/orders/${String(o.id).split('/').pop()}\" style=\"color:${C.ink}\">${esc(o.name)}</a>`;\r\n\r\n  let html = `<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;background:${C.bg};font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif\">\r\n<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\" style=\"padding:24px 12px\">\r\n<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;background:#fff;border-radius:12px\">\r\n<tr><td style=\"padding:22px 24px 4px;font-size:13px;color:${C.muted}\">${esc(c.shop.name)} · Morning Check</td></tr>`;\r\n  html += section(`Paid but not shipped after ${c.stuckAfter}h (${c.stuck.length})`, c.stuck.length\r\n    ? table(['Order', 'Status', 'Waiting', 'Total'], c.stuck.slice(0, 25).map(o => [link(o), esc(o.status),\r\n      o.hours >= 48 ? `${Math.floor(o.hours / 24)} days` : `${o.hours} h`, fmtMoney(o.total, c.shop.currency)]))\r\n    : ok('Nothing waiting. Every paid order has shipped.'));\r\n  html += section(`Stock at or below ${c.threshold} units (${c.lowStock.length})`, c.lowStock.length\r\n    ? table(['Product', 'On hand'], c.lowStock.slice(0, 40).map(s => [`${esc(s.product)}${s.variant ? ` <span style=\"color:${C.muted}\">· ${esc(s.variant)}</span>` : ''}`,\r\n      s.onHand <= 0 ? `<b style=\"color:${C.red}\">${s.onHand}</b>` : String(s.onHand)]))\r\n    : ok('No tracked variant is running low.'));\r\n  html += `<tr><td style=\"padding:16px 24px 22px;font-size:11px;color:${C.muted}\">Active products with tracked inventory only. Thresholds live in the Config node.</td></tr>\r\n</table></td></tr></table></body></html>`;\r\n  return html;\r\n}\r\n\r\nconst DEFAULTS = { stuck_after_hours: 48, low_stock_threshold: 5, include_sold_out: false, api_version: '2026-07' };\r\n\r\nfunction withDefaults(cfg) {\r\n  const out = { ...DEFAULTS };\r\n  for (const [k, v] of Object.entries(cfg || {})) if (v !== '' && v !== null && v !== undefined) out[k] = v;\r\n  out.stuck_after_hours = Number(out.stuck_after_hours);\r\n  out.low_stock_threshold = Number(out.low_stock_threshold);\r\n  out.include_sold_out = out.include_sold_out === true || out.include_sold_out === 'true';\r\n  return out;\r\n}\n\n// ---------------------------------------------------------------\n\nconst cfg = withDefaults($('Config').first().json);\nconst d = String(cfg.shop_domain || '').trim().replace(/\\/+$/, '');\nif (!d || d === 'your-store.myshopify.com') throw new Error('Set shop_domain in the Config node (e.g. my-shop.myshopify.com).');\nconst base = /^https?:\\/\\//.test(d) ? d : 'https://' + d;\nconst token = $('Get Shopify access token').first().json.access_token;\nif (!token) throw new Error('Shopify did not return an access token. Check the Client ID/secret in the Custom Auth credential.');\nconst sleep = ms => new Promise(r => setTimeout(r, ms));\n\nconst gql = async (query, variables) => {\n  for (let attempt = 1; attempt <= 5; attempt++) {\n    let res;\n    try {\n      res = await this.helpers.httpRequest({\n        method: 'POST',\n        url: `${base}/admin/api/${cfg.api_version}/graphql.json`,\n        headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },\n        body: { query, variables },\n        json: true,\n        timeout: 60000,\n      });\n    } catch (e) {\n      const status = String(e.httpCode || (e.response && e.response.status) || '');\n      if ((status === '429' || status.startsWith('5')) && attempt < 5) { await sleep(1500 * attempt); continue; }\n      throw e;\n    }\n    if (res.errors) {\n      const text = JSON.stringify(res.errors);\n      if (text.includes('THROTTLED') && attempt < 5) { await sleep(2000 * attempt); continue; }\n      if (text.includes('ACCESS_DENIED')) throw new Error('Missing access scope. The app needs read_orders, read_products and read_inventory.');\n      throw new Error('Shopify API error: ' + text.slice(0, 500));\n    }\n    return res.data;\n  }\n  throw new Error('Shopify kept rate-limiting the requests. Try again later.');\n};\n\nconst check = analyzeCheck(await fetchCheck(gql, cfg, new Date()), cfg);\nreturn [{ json: { subject: subjectCheck(check), html: renderCheck(check), stuck: check.stuck.length, low_stock: check.lowStock.length } }];"
+        "method": "POST",
+        "url": "={{ (/^https?:\\/\\//.test($('Config').item.json.shop_domain) ? $('Config').item.json.shop_domain : 'https://' + $('Config').item.json.shop_domain).replace(/\\/+$/, '') }}/admin/api/{{ $('Config').item.json.api_version }}/graphql.json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $('Get Shopify access token').item.json.access_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query($q: String!) { shop { name myshopifyDomain currencyCode } orders(first: 100, query: $q, sortKey: CREATED_AT) { nodes { id name createdAt displayFulfillmentStatus totalPriceSet { shopMoney { amount } } } } }\", variables: { q: \"financial_status:paid AND status:open AND (fulfillment_status:unshipped OR fulfillment_status:partial) AND created_at:<'\" + $now.minus({ hours: Number($('Config').item.json.stuck_after_hours) }).toUTC().toISO({ suppressMilliseconds: true }) + \"'\" } }) }}",
+        "options": {
+          "timeout": 60000
+        }
       },
-      "id": "1a8c441f-0de3-4c41-afec-3dc89956239e",
-      "name": "Check store",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "id": "b70dd177-4bfa-4f08-a0f6-62f0dde5148d",
+      "name": "Get stuck orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
         660,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ (/^https?:\\/\\//.test($('Config').item.json.shop_domain) ? $('Config').item.json.shop_domain : 'https://' + $('Config').item.json.shop_domain).replace(/\\/+$/, '') }}/admin/api/{{ $('Config').item.json.api_version }}/graphql.json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $('Get Shopify access token').item.json.access_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query($q: String!) { productVariants(first: 100, query: $q) { nodes { id title inventoryQuantity inventoryItem { tracked } product { title status } } } }\", variables: { q: 'inventory_quantity:<=' + Number($('Config').item.json.low_stock_threshold) } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "7f9d263b-abd8-41f7-a9ef-72b236a1832c",
+      "name": "Get low-stock variants",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "err",
+              "leftValue": "={{ !!($('Get stuck orders').item.json.errors || $json.errors) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "71f57ea5-9106-44d1-ad92-bf49ecb006ef",
+      "name": "Shopify error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
         300
       ]
     },
     {
       "parameters": {
-        "sendTo": "={{ $('Config').first().json.email_to }}",
-        "subject": "={{ $json.subject }}",
+        "errorMessage": "={{ 'Shopify API error: ' + JSON.stringify($('Get stuck orders').item.json.errors || $json.errors).slice(0, 400) + ' (check the app scopes: read_orders, read_products, read_inventory)' }}"
+      },
+      "id": "73fc7f3c-aa82-4e10-a207-8c0ffad7eeb6",
+      "name": "Stop: Shopify error",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5bfc9159-6c93-4a29-a302-b13326bd6e4b",
+              "name": "shop_name",
+              "value": "={{ $('Get stuck orders').item.json.data.shop.name }}",
+              "type": "string"
+            },
+            {
+              "id": "4b58800b-493f-464f-aab1-81f86428bbd5",
+              "name": "admin_url",
+              "value": "={{ 'https://admin.shopify.com/store/' + $('Get stuck orders').item.json.data.shop.myshopifyDomain.replace('.myshopify.com', '') }}",
+              "type": "string"
+            },
+            {
+              "id": "a65255c3-dddf-4659-ac66-2f282326415f",
+              "name": "stuck_orders",
+              "value": "={{ $('Get stuck orders').item.json.data.orders.nodes.map(o => ({\n  name: o.name,\n  id: o.id.split('/').pop(),\n  status: o.displayFulfillmentStatus === 'PARTIALLY_FULFILLED' ? 'Partly shipped' : 'Not shipped',\n  waiting_hours: Math.floor(($now.toMillis() - new Date(o.createdAt).getTime()) / 3600000),\n  total: new Intl.NumberFormat('en-US', { style: 'currency', currency: $('Get stuck orders').item.json.data.shop.currencyCode }).format(Number(o.totalPriceSet.shopMoney.amount)),\n})).sort((a, b) => b.waiting_hours - a.waiting_hours) }}",
+              "type": "array"
+            },
+            {
+              "id": "1dc3fcf2-2454-417c-a193-12e3efbcb25a",
+              "name": "low_stock",
+              "value": "={{ $json.data.productVariants.nodes\n  .filter(v => v.inventoryItem.tracked && v.product.status === 'ACTIVE' && v.inventoryQuantity > 0)\n  .map(v => ({ product: v.product.title, variant: v.title === 'Default Title' ? '' : v.title, on_hand: v.inventoryQuantity }))\n  .sort((a, b) => a.on_hand - b.on_hand) }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e07e78e7-ab7a-48a0-aaa5-bc532fc2814e",
+      "name": "Build the report",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1320,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "n",
+              "leftValue": "={{ $json.stuck_orders.length + $json.low_stock.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "f046aae8-16cb-4b16-acc8-14ccb219af20",
+      "name": "Anything to report?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "html": "<div style=\"font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f6f6f4;padding:24px 12px\">\n<div style=\"max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;padding:22px 24px\">\n<div style=\"font-size:13px;color:#6b6b6b\">{{ $json.shop_name }} · Morning Check</div>\n\n<h3 style=\"font-size:15px;color:#1a1a1a;margin:18px 0 6px\">Paid but not shipped after {{ $('Config').item.json.stuck_after_hours }}h ({{ $json.stuck_orders.length }})</h3>\n{{ $json.stuck_orders.length ? '<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse:collapse;font-size:13px\">' + $json.stuck_orders.map(o => '<tr><td style=\"padding:7px 0;border-bottom:1px solid #e6e6e6\"><a href=\"' + $json.admin_url + '/orders/' + o.id + '\" style=\"color:#1a1a1a\">' + o.name + '</a></td><td style=\"text-align:right;border-bottom:1px solid #e6e6e6\">' + o.status + '</td><td style=\"text-align:right;border-bottom:1px solid #e6e6e6\">' + (o.waiting_hours >= 48 ? Math.floor(o.waiting_hours / 24) + ' days' : o.waiting_hours + ' h') + '</td><td style=\"text-align:right;border-bottom:1px solid #e6e6e6\">' + o.total + '</td></tr>').join('') + '</table>' : '<p style=\"font-size:14px;color:#067647\">Nothing waiting. Every paid order has shipped.</p>' }}\n\n<h3 style=\"font-size:15px;color:#1a1a1a;margin:18px 0 6px\">Stock at or below {{ $('Config').item.json.low_stock_threshold }} units ({{ $json.low_stock.length }})</h3>\n{{ $json.low_stock.length ? '<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse:collapse;font-size:13px\">' + $json.low_stock.map(v => '<tr><td style=\"padding:7px 0;border-bottom:1px solid #e6e6e6\">' + v.product + (v.variant ? ' <span style=\"color:#6b6b6b\">· ' + v.variant + '</span>' : '') + '</td><td style=\"text-align:right;border-bottom:1px solid #e6e6e6\">' + v.on_hand + '</td></tr>').join('') + '</table>' : '<p style=\"font-size:14px;color:#067647\">No tracked variant is running low.</p>' }}\n\n<p style=\"font-size:11px;color:#6b6b6b;margin-top:18px\">Active products with tracked inventory only. Change the thresholds in the Config node.</p>\n</div></div>"
+      },
+      "id": "d678dd71-bb56-4bf9-a7c3-120e1749ada2",
+      "name": "Email template",
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        1760,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Config').item.json.email_to }}",
+        "subject": "={{ $('Build the report').item.json.shop_name + ': ' + [ $('Build the report').item.json.stuck_orders.length ? $('Build the report').item.json.stuck_orders.length + ' unshipped orders' : '', $('Build the report').item.json.low_stock.length ? $('Build the report').item.json.low_stock.length + ' low-stock variants' : '' ].filter(Boolean).join(', ') }}",
         "message": "={{ $json.html }}",
         "options": {
           "appendAttribution": false
@@ -131,24 +316,82 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.1,
       "position": [
-        880,
-        300
+        1980,
+        280
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "1bb2956e-ea75-4889-af07-c30690dd525e",
+      "name": "All clear, no email",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        500
       ]
     },
     {
       "parameters": {
-        "content": "## Shopify Morning Check (free)\n\nEvery morning: **paid orders that still haven't shipped** and **variants running low**, in one email.\n\n**Setup (5 min):**\n1. In the Shopify Dev Dashboard, create an app with scopes `read_orders,read_products,read_inventory` and install it on your store.\n2. **Config** → your `shop_domain` and `email_to`.\n3. **Get Shopify access token** → Custom Auth credential:\n`{\"body\":{\"client_id\":\"…\",\"client_secret\":\"…\"}}`\n4. Connect **Gmail**, run once, then **Publish**.\n\nFull guide: see the README on GitHub.\n\n_QuietOps · quiet automations for busy businesses_",
-        "height": 360,
-        "width": 460,
-        "color": 4
+        "content": "## Shopify Morning Check\n\nEvery morning at 7:00 you get one email with the paid orders that still haven't shipped and the product variants that are running low, so you can fix them before customers start asking \"where is my order?\". Quiet mornings send nothing.\n\n## How it works\n1. **Every morning at 7** starts the run and **Config** holds your settings.\n2. **Get Shopify access token** asks Shopify for a fresh Admin API token (Dev Dashboard apps use the client-credentials grant; tokens expire after 24h).\n3. **Get stuck orders** and **Get low-stock variants** query the Admin GraphQL API.\n4. **Build the report** keeps tracked, active, in-stock variants and computes how long each order has waited.\n5. **Anything to report?** skips the email on quiet days; otherwise **Email template** builds the HTML and Gmail sends it.\n\n## Setup steps\n1. In the Shopify Dev Dashboard, create an app with the scopes `read_orders,read_products,read_inventory`, uncheck \"Embed app in Shopify admin\" and install it on your store.\n2. In **Get Shopify access token**, create a Custom Auth credential: `{\"body\":{\"client_id\":\"YOUR_ID\",\"client_secret\":\"YOUR_SECRET\"}}`\n3. In **Config**, set `shop_domain` (the .myshopify.com address) and `email_to`.\n4. Connect Gmail, click Execute workflow to test, then publish.\n\n## Customize\nChange `stuck_after_hours` and `low_stock_threshold` in **Config**, or swap Gmail for Slack, Outlook or SMTP.\n\n_QuietOps · quiet automations for busy businesses_",
+        "height": 760,
+        "width": 560
       },
       "id": "a3514e43-b0b7-426d-a97e-b58679e3a56c",
       "name": "Note 1",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        -60,
-        -60
+        -640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Fresh token every run\nThe token request is sent as **JSON**, so n8n merges the Custom Auth credential's client_id and client_secret into it. With form-urlencoded it would silently drop them.",
+        "height": 240,
+        "width": 300,
+        "color": 7
+      },
+      "id": "fe5c3e81-b61b-4f48-af81-17ee772fc668",
+      "name": "Note 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        380,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Read the store\nTwo GraphQL calls with retry on failure. Only `read_*` scopes, no customer data (customer names would need the protected `read_customers` scope). Each call returns up to 100 results.",
+        "height": 240,
+        "width": 340,
+        "color": 7
+      },
+      "id": "d73df4ad-9420-474c-a9ce-551567b6d467",
+      "name": "Note 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Shape and send\nIf Shopify returns an error the run stops with a clear message. Otherwise the report is built, empty days are skipped, and the email links every order to your Shopify admin.",
+        "height": 220,
+        "width": 360,
+        "color": 7
+      },
+      "id": "ee803a54-fc0e-4aa9-a8e2-0e4a2c70bdf3",
+      "name": "Note 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        620
       ]
     }
   ],
@@ -179,14 +422,83 @@
       "main": [
         [
           {
-            "node": "Check store",
+            "node": "Get stuck orders",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Check store": {
+    "Get stuck orders": {
+      "main": [
+        [
+          {
+            "node": "Get low-stock variants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get low-stock variants": {
+      "main": [
+        [
+          {
+            "node": "Shopify error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify error?": {
+      "main": [
+        [
+          {
+            "node": "Stop: Shopify error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build the report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build the report": {
+      "main": [
+        [
+          {
+            "node": "Anything to report?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to report?": {
+      "main": [
+        [
+          {
+            "node": "Email template",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "All clear, no email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email template": {
       "main": [
         [
           {
